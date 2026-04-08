@@ -36,6 +36,9 @@ OPTIONAL_COLUMN_ALIASES = {
     "внеучебная активность": "events_count",
     "олимпиады": "olympiads_count",
     "конкурсы": "contests_count",
+    "статус без выбора": "no_choice_status",
+    "статус выбора трека": "no_choice_status",
+    "ситуация без выбора": "no_choice_status",
 }
 
 
@@ -517,7 +520,10 @@ def parse_students_from_workbook(workbook: WorkbookData) -> Tuple[List[dict], Li
             continue
         track_values = {track_name: parse_int(get_cell(sheet, row, col).strip()) for track_name, col in track_columns}
         optional = {key: parse_float(get_cell(sheet, row, col).strip()) for key, col in optional_columns.items()}
+        if "no_choice_status" in optional_columns:
+            optional["no_choice_status"] = get_cell(sheet, row, optional_columns["no_choice_status"]).strip()
         olympiad_score = calculate_olympiad_score(sheet, row, olympiad_columns) if olympiad_columns else (optional.get("olympiads_count") or 0.0)
+        has_track_choice = any(value > 0 for value in normalize_track_preferences(track_values, track_names).values())
         students.append(
             {
                 "id": raw_id,
@@ -525,6 +531,7 @@ def parse_students_from_workbook(workbook: WorkbookData) -> Tuple[List[dict], Li
                 "track_preferences": normalize_track_preferences(track_values, track_names),
                 "optional": optional,
                 "olympiad_score": olympiad_score,
+                "has_track_choice": has_track_choice,
             }
         )
     if not students:
@@ -556,7 +563,17 @@ def assign_tracks(ranked_students: List[dict], track_names: List[str]) -> List[d
     for student in ranked_students:
         assigned = choose_track(student["track_preferences"], track_names, loads, capacities)
         loads[assigned] += 1
-        results.append({"id": student["id"], "track": assigned, "place": student["rating_place"], "rating": student["rating"]})
+        results.append(
+            {
+                "id": student["id"],
+                "track": assigned,
+                "place": student["rating_place"],
+                "rating": student["rating"],
+                "has_track_choice": student.get("has_track_choice", True),
+                "no_choice_status": student["optional"].get("no_choice_status", ""),
+                "track_preferences": student["track_preferences"],
+            }
+        )
     return results
 
 
@@ -586,21 +603,34 @@ def build_sheet_xml(rows: Sequence[Sequence[object]]) -> str:
     )
 
 
-def write_simple_xlsx(path: Path, sheet_name: str, rows: Sequence[Sequence[object]]) -> None:
+def write_xlsx_workbook(path: Path, sheets: Sequence[Tuple[str, Sequence[Sequence[object]]]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     created = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    sheet_defs = [(name[:31], rows) for name, rows in sheets]
+    workbook_sheet_xml = "".join(
+        f'<sheet name="{escape(name)}" sheetId="{index}" r:id="rId{index}"/>'
+        for index, (name, _) in enumerate(sheet_defs, start=1)
+    )
     workbook_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
         'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        f'<sheets><sheet name="{escape(sheet_name)}" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        f"<sheets>{workbook_sheet_xml}</sheets></workbook>"
+    )
+    sheet_rel_xml = "".join(
+        f'<Relationship Id="rId{index}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{index}.xml"/>'
+        for index, _ in enumerate(sheet_defs, start=1)
     )
     workbook_rels_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
-        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
-        '</Relationships>'
+        f'{sheet_rel_xml}'
+        f'<Relationship Id="rId{len(sheet_defs) + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        "</Relationships>"
+    )
+    sheet_content_types = "".join(
+        f'<Override PartName="/xl/worksheets/sheet{index}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        for index, _ in enumerate(sheet_defs, start=1)
     )
     root_rels_xml = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -616,7 +646,7 @@ def write_simple_xlsx(path: Path, sheet_name: str, rows: Sequence[Sequence[objec
         '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
         '<Default Extension="xml" ContentType="application/xml"/>'
         '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        f"{sheet_content_types}"
         '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
         '<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>'
         '<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>'
@@ -655,27 +685,61 @@ def write_simple_xlsx(path: Path, sheet_name: str, rows: Sequence[Sequence[objec
         archive.writestr("xl/workbook.xml", workbook_xml)
         archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
         archive.writestr("xl/styles.xml", styles_xml)
-        archive.writestr("xl/worksheets/sheet1.xml", build_sheet_xml(rows))
+        for index, (_, rows) in enumerate(sheet_defs, start=1):
+            archive.writestr(f"xl/worksheets/sheet{index}.xml", build_sheet_xml(rows))
+
+
+def write_simple_xlsx(path: Path, sheet_name: str, rows: Sequence[Sequence[object]]) -> None:
+    write_xlsx_workbook(path, [(sheet_name, rows)])
 
 
 def create_sample_input_file(path: Path) -> None:
     rows = [
         ["Пример входных данных для распределения по трекам"],
-        ["", "1 семестр", "", "", "2 семестр", "", "", "3 семестр", "", "", "", "", "", "", "", "", "", "", ""],
-        ["id", "Математика", "Программирование", "Английский язык", "Математика", "Алгоритмы", "Проект", "Математика", "Алгоритмы", "Проект", "Трек А", "Трек В", "Трек С", "Посещаемость %", "Внеучебные мероприятия", "Олимпиада 1", "Вес олимпиады 1", "Олимпиада 2", "Вес олимпиады 2", "Конкурсы"],
-        ["1001", 4, 4, 5, 4, 5, 4, 5, 5, 5, 1, 2, 3, 96, 3, 1, 1.5, 0, 0, 0],
-        ["1002", 5, 5, 5, 5, 4, 5, 5, 5, 5, 0, 0, 0, 90, 1, 1, 2.0, 1, 0.5, 1],
-        ["1003", 3, 4, 4, 4, 4, 4, 5, 5, 4, 3, 1, 2, 88, 2, 0, 0, 1, 1.0, 0],
-        ["1004", 4, 3, 4, 4, 4, 5, 4, 5, 5, 2, 3, 1, 100, 4, 1, 3.0, 1, 2.0, 1],
+        ["", "1 семестр", "", "", "2 семестр", "", "", "3 семестр", "", "", "", "", "", "", "", "", "", "", "", ""],
+        ["id", "Математика", "Программирование", "Английский язык", "Математика", "Алгоритмы", "Проект", "Математика", "Алгоритмы", "Проект", "Трек А", "Трек В", "Трек С", "Посещаемость %", "Внеучебные мероприятия", "Олимпиада 1", "Вес олимпиады 1", "Олимпиада 2", "Вес олимпиады 2", "Конкурсы", "Статус без выбора"],
+        ["1001", 4, 4, 5, 4, 5, 4, 5, 5, 5, 1, 2, 3, 96, 3, 1, 1.5, 0, 0, 0, ""],
+        ["1002", 5, 5, 5, 5, 4, 5, 5, 5, 5, 0, 0, 0, 90, 1, 1, 2.0, 1, 0.5, 1, "сделает выбор позднее"],
+        ["1003", 3, 4, 4, 4, 4, 4, 5, 5, 4, 3, 1, 2, 88, 2, 0, 0, 1, 1.0, 0, ""],
+        ["1004", 4, 3, 4, 4, 4, 5, 4, 5, 5, 0, 0, 0, 100, 4, 1, 3.0, 1, 2.0, 1, "уйдет"],
     ]
     write_simple_xlsx(path, "Входные данные", rows)
 
 
-def write_output_file(path: Path, assignments: List[dict]) -> None:
-    rows: List[List[object]] = [["id ученика", "трек", "место в рейтинге", "рейтинг"]]
+def write_output_file(path: Path, assignments: List[dict], track_names: List[str]) -> None:
+    result_rows: List[List[object]] = [["id ученика", "трек", "место в рейтинге", "рейтинг", "выбор трека", "статус без выбора", "приоритеты"]]
+    no_choice_rows: List[List[object]] = [["id ученика", "трек", "место в рейтинге", "рейтинг", "статус без выбора"]]
+    assigned_count = {track_name: 0 for track_name in track_names}
+    priority_summary_rows: List[List[object]] = [["трек", "назначено студентов", "приоритет 1", "приоритет 1 или 2"]]
+    priority_list_rows: List[List[object]] = [["трек", "количество студентов с приоритетом 1 или 2", "id студентов с приоритетом 1 или 2"]]
+
     for item in assignments:
-        rows.append([item["id"], item["track"], item["place"], item["rating"]])
-    write_simple_xlsx(path, "Результат", rows)
+        assigned_count[item["track"]] += 1
+        priorities_text = ", ".join(f"{track_name}: {item['track_preferences'].get(track_name, 0)}" for track_name in track_names)
+        choice_mark = "выбор указан" if item["has_track_choice"] else "выбор не указан"
+        no_choice_status = item["no_choice_status"] if item["has_track_choice"] else (item["no_choice_status"] or "статус не указан")
+        result_rows.append([item["id"], item["track"], item["place"], item["rating"], choice_mark, no_choice_status if not item["has_track_choice"] else "", priorities_text])
+        if not item["has_track_choice"]:
+            no_choice_rows.append([item["id"], item["track"], item["place"], item["rating"], no_choice_status])
+
+    if len(no_choice_rows) == 1:
+        no_choice_rows.append(["нет студентов без выбора", "", "", "", ""])
+
+    for track_name in track_names:
+        priority_1_ids = [item["id"] for item in assignments if item["track_preferences"].get(track_name) == 1]
+        priority_1_2_ids = [item["id"] for item in assignments if item["track_preferences"].get(track_name) in (1, 2)]
+        priority_summary_rows.append([track_name, assigned_count[track_name], len(priority_1_ids), len(priority_1_2_ids)])
+        priority_list_rows.append([track_name, len(priority_1_2_ids), ", ".join(priority_1_2_ids)])
+
+    write_xlsx_workbook(
+        path,
+        [
+            ("Результат", result_rows),
+            ("Количество_по_трекам", priority_summary_rows),
+            ("Без_выбора", no_choice_rows),
+            ("Приоритеты_1_2", priority_list_rows),
+        ],
+    )
 
 
 def run(input_file: Path, output_folder: Path) -> Tuple[Path, int]:
@@ -684,7 +748,7 @@ def run(input_file: Path, output_folder: Path) -> Tuple[Path, int]:
     ranked_students = rank_students(students)
     assignments = assign_tracks(ranked_students, track_names)
     output_file = output_folder / OUTPUT_FILE_NAME
-    write_output_file(output_file, assignments)
+    write_output_file(output_file, assignments, track_names)
     return output_file, len(assignments)
 
 
