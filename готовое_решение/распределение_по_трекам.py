@@ -11,9 +11,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 from xml.sax.saxutils import escape
 
+"""Скрипт читает Excel-файл со студентами, их оценками и приоритетами треков,
+а затем распределяет студентов по трекам либо по предпочтениям, либо с учетом рейтинга."""
+
 OUTPUT_FOLDER_NAME = "выход"
 SAMPLE_INPUT_FILE_NAME = "образец_входных_данных.xlsx"
 OUTPUT_FILE_NAME = "результат_распределения.xlsx"
+DEFAULT_ASSIGNMENT_MODE = "preferences_only"
 
 SEMESTER_AVERAGE_SHARE = 0.25
 OVERALL_AVERAGE_SHARE = 0.15
@@ -43,12 +47,14 @@ OPTIONAL_COLUMN_ALIASES = {
 
 
 def normalize_text(value: object) -> str:
+    """Приводит текст к унифицированному виду для поиска и сравнения заголовков."""
     text = "" if value is None else str(value)
     text = text.replace("\xa0", " ").strip().lower().replace("ё", "е")
     return re.sub(r"\s+", " ", text)
 
 
 def normalize_subject_name(value: str) -> str:
+    """Нормализует название предмета, чтобы одинаковые дисциплины из разных семестров совпадали."""
     text = normalize_text(value)
     text = re.sub(r"\([^)]*\)", "", text)
     text = re.sub(r"[^a-zа-я0-9 ]+", " ", text)
@@ -61,6 +67,7 @@ def normalize_subject_name(value: str) -> str:
 
 
 def parse_float(value: object) -> Optional[float]:
+    """Преобразует строку или число в float, если это возможно."""
     if value is None:
         return None
     text = str(value).strip()
@@ -74,15 +81,18 @@ def parse_float(value: object) -> Optional[float]:
 
 
 def parse_int(value: object) -> Optional[int]:
+    """Преобразует значение в целое число через parse_float."""
     number = parse_float(value)
     return None if number is None else int(round(number))
 
 
 def safe_mean(values: Sequence[float], default: float = 0.0) -> float:
+    """Возвращает среднее значение или запасной default для пустой последовательности."""
     return float(mean(values)) if values else default
 
 
 def column_letters_to_index(letters: str) -> int:
+    """Переводит буквенное обозначение Excel-колонки в числовой индекс."""
     value = 0
     for letter in letters:
         value = value * 26 + (ord(letter.upper()) - ord("A") + 1)
@@ -90,6 +100,7 @@ def column_letters_to_index(letters: str) -> int:
 
 
 def index_to_column_letters(index: int) -> str:
+    """Переводит числовой индекс колонки обратно в Excel-формат A, B, AA и т.д."""
     letters: List[str] = []
     while index > 0:
         index, rest = divmod(index - 1, 26)
@@ -98,6 +109,7 @@ def index_to_column_letters(index: int) -> str:
 
 
 def parse_cell_ref(ref: str) -> Tuple[int, int]:
+    """Разбирает ссылку на ячейку Excel и возвращает номер строки и столбца."""
     match = re.match(r"([A-Z]+)(\d+)", ref)
     if not match:
         raise ValueError(f"Некорректная ссылка на ячейку: {ref}")
@@ -106,11 +118,13 @@ def parse_cell_ref(ref: str) -> Tuple[int, int]:
 
 
 def extract_semester_number(value: str) -> Optional[int]:
+    """Ищет в тексте номер семестра вида '1 семестр', '2 семестр' и т.п."""
     match = re.search(r"(\d+)\s*сем", normalize_text(value))
     return int(match.group(1)) if match else None
 
 
 def extract_olympiad_value_index(header: str) -> Optional[int]:
+    """Определяет номер колонки с участием в олимпиаде: Олимпиада 1, Олимпиада 2 и т.д."""
     normalized = normalize_text(header)
     patterns = [
         r"олимпиада\s*№?\s*(\d+)$",
@@ -124,6 +138,7 @@ def extract_olympiad_value_index(header: str) -> Optional[int]:
 
 
 def extract_olympiad_scale_index(header: str) -> Optional[int]:
+    """Определяет номер колонки с весом олимпиады: Вес олимпиады 1, Вес олимпиады 2 и т.д."""
     normalized = normalize_text(header)
     patterns = [
         r"(?:вес|скейл|scale)\s*олимпиады?\s*№?\s*(\d+)$",
@@ -137,6 +152,7 @@ def extract_olympiad_scale_index(header: str) -> Optional[int]:
 
 
 def is_reserved_header(header: str) -> bool:
+    """Проверяет, относится ли колонка к служебным, а не к оценкам по предметам."""
     normalized = normalize_text(header)
     return (
         not normalized
@@ -150,11 +166,14 @@ def is_reserved_header(header: str) -> bool:
 
 
 class WorkbookData:
+    """Простая обертка над листами Excel-файла после чтения из xlsx."""
+
     def __init__(self, sheets: List[dict]) -> None:
         self.sheets = sheets
 
 
 def read_xml_from_zip(archive: zipfile.ZipFile, name: str) -> Optional[ET.Element]:
+    """Читает XML-файл из zip-архива xlsx и возвращает корневой элемент."""
     try:
         with archive.open(name) as handle:
             return ET.fromstring(handle.read())
@@ -163,6 +182,7 @@ def read_xml_from_zip(archive: zipfile.ZipFile, name: str) -> Optional[ET.Elemen
 
 
 def read_xlsx(path: Path) -> WorkbookData:
+    """Читает xlsx без внешних библиотек и собирает листы в удобную структуру."""
     with zipfile.ZipFile(path, "r") as archive:
         shared_strings_root = read_xml_from_zip(archive, "xl/sharedStrings.xml")
         shared_strings: List[str] = []
@@ -217,10 +237,12 @@ def read_xlsx(path: Path) -> WorkbookData:
 
 
 def get_cell(sheet: dict, row_number: int, col_number: int) -> str:
+    """Возвращает значение ячейки по номеру строки и столбца."""
     return sheet["rows"].get(row_number, {}).get(col_number, "")
 
 
 def find_input_sheet(workbook: WorkbookData) -> Tuple[dict, int]:
+    """Ищет лист, на котором есть колонка id и колонки с треками."""
     fallback = None
     for sheet in workbook.sheets:
         for row_number in range(1, min(sheet["max_row"], 12) + 1):
@@ -237,6 +259,7 @@ def find_input_sheet(workbook: WorkbookData) -> Tuple[dict, int]:
 
 
 def read_header_map(sheet: dict, header_row: int) -> Dict[int, str]:
+    """Считывает строку заголовков и возвращает словарь 'номер колонки -> заголовок'."""
     headers: Dict[int, str] = {}
     for col in range(1, sheet["max_col"] + 1):
         value = get_cell(sheet, header_row, col).strip()
@@ -246,6 +269,7 @@ def read_header_map(sheet: dict, header_row: int) -> Dict[int, str]:
 
 
 def read_semester_marks(sheet: dict, semester_row: int, max_col: int) -> Dict[int, Optional[int]]:
+    """Определяет, к какому семестру относится каждая колонка с оценками."""
     marks: Dict[int, Optional[int]] = {}
     current_semester: Optional[int] = None
     for col in range(1, max_col + 1):
@@ -258,6 +282,7 @@ def read_semester_marks(sheet: dict, semester_row: int, max_col: int) -> Dict[in
 
 
 def detect_optional_columns(headers: Dict[int, str]) -> Dict[str, int]:
+    """Находит необязательные колонки: посещаемость, мероприятия, конкурсы и т.д."""
     columns: Dict[str, int] = {}
     for col, header in headers.items():
         normalized = normalize_text(header)
@@ -267,6 +292,7 @@ def detect_optional_columns(headers: Dict[int, str]) -> Dict[str, int]:
 
 
 def detect_olympiad_columns(headers: Dict[int, str]) -> List[dict]:
+    """Собирает пары колонок 'значение олимпиады' и 'вес олимпиады'."""
     value_columns: Dict[int, int] = {}
     scale_columns: Dict[int, int] = {}
     for col, header in headers.items():
@@ -289,6 +315,7 @@ def detect_olympiad_columns(headers: Dict[int, str]) -> List[dict]:
 
 
 def calculate_olympiad_score(sheet: dict, row: int, olympiad_columns: Sequence[dict]) -> float:
+    """Считает суммарный олимпиадный вклад студента по всем найденным парам колонок."""
     total = 0.0
     for slot in olympiad_columns:
         raw_value = get_cell(sheet, row, slot["value_col"]).strip()
@@ -304,6 +331,7 @@ def calculate_olympiad_score(sheet: dict, row: int, olympiad_columns: Sequence[d
 
 
 def extract_track_columns(headers: Dict[int, str]) -> List[Tuple[str, int]]:
+    """Извлекает колонки с треками и сохраняет их порядок."""
     tracks = [(header.strip(), col) for col, header in headers.items() if normalize_text(header).startswith("трек")]
     if len(tracks) < 2:
         raise ValueError("Нужно минимум два столбца с приоритетами треков.")
@@ -311,6 +339,7 @@ def extract_track_columns(headers: Dict[int, str]) -> List[Tuple[str, int]]:
 
 
 def extract_grade_columns(headers: Dict[int, str], semester_marks: Dict[int, Optional[int]]) -> List[dict]:
+    """Выделяет колонки с оценками по предметам и помечает, к какому семестру они относятся."""
     grade_columns: List[dict] = []
     for col, header in headers.items():
         semester_number = semester_marks.get(col)
@@ -330,12 +359,14 @@ def extract_grade_columns(headers: Dict[int, str], semester_marks: Dict[int, Opt
 
 
 def compute_semester_weights(semesters: Sequence[int]) -> Dict[int, float]:
+    """Строит возрастающие веса для семестров: поздний семестр важнее раннего."""
     ordered = sorted(set(semesters))
     denominator = sum(range(1, len(ordered) + 1))
     return {semester: index / denominator for index, semester in enumerate(ordered, start=1)}
 
 
 def normalize_track_preferences(track_values: Dict[str, Optional[int]], track_names: Sequence[str]) -> Dict[str, int]:
+    """Приводит приоритеты треков к единому словарю с нулями для пропусков."""
     result: Dict[str, int] = {}
     for track in track_names:
         value = track_values.get(track)
@@ -344,6 +375,7 @@ def normalize_track_preferences(track_values: Dict[str, Optional[int]], track_na
 
 
 def choose_track(preferences: Dict[str, int], track_names: Sequence[str], loads: Dict[str, int], capacities: Dict[str, int]) -> str:
+    """Выбирает трек жадным способом для режима, где студенты идут по уже готовому рейтингу."""
     available = [track for track in track_names if loads[track] < capacities[track]]
     if not available:
         raise ValueError("Не осталось доступных треков.")
@@ -360,17 +392,126 @@ def choose_track(preferences: Dict[str, int], track_names: Sequence[str], loads:
 
 
 def build_balanced_capacities(track_names: Sequence[str], student_count: int) -> Dict[str, int]:
+    """Считает целевую емкость треков так, чтобы распределение было максимально равномерным."""
     base = student_count // len(track_names)
     extra = student_count % len(track_names)
     return {track_name: base + (1 if index < extra else 0) for index, track_name in enumerate(track_names)}
 
 
+def add_score_tuple(left: Tuple[int, int, int, int, int], right: Tuple[int, int, int, int, int]) -> Tuple[int, int, int, int, int]:
+    """Складывает лексикографические оценки, используемые в оптимизации по предпочтениям."""
+    return tuple(left[index] + right[index] for index in range(len(left)))  # type: ignore[return-value]
+
+
+def calculate_preference_score(student: dict, track_name: str) -> Tuple[int, int, int, int, int]:
+    """Возвращает вклад конкретного назначения в целевую функцию оптимизации по предпочтениям."""
+    preferences = student["track_preferences"]
+    positive_preferences = [rank for rank in preferences.values() if rank > 0]
+    if not positive_preferences:
+        return (0, 0, 1, 0, 0)
+    rank = preferences.get(track_name, 0)
+    if rank == 1:
+        return (1, 0, 0, 0, 0)
+    if rank == 2:
+        return (0, 1, 0, 0, 0)
+    if rank >= 3:
+        return (0, 0, 0, -rank, 0)
+    return (0, 0, 0, 0, -1)
+
+
+def build_assignment_rank_text(student: dict, assigned_track: str) -> str:
+    """Переводит факт назначения в понятный текст: приоритет 1, приоритет 2, без выбора и т.д."""
+    preferences = student["track_preferences"]
+    if not any(rank > 0 for rank in preferences.values()):
+        return "выбор не указан"
+    rank = preferences.get(assigned_track, 0)
+    if rank > 0:
+        return f"приоритет {rank}"
+    return "вне указанных приоритетов"
+
+
+def assign_tracks_by_preferences_only(students: List[dict], track_names: List[str]) -> List[dict]:
+    """Оптимально распределяет студентов только по предпочтениям без использования оценок и рейтинга."""
+    if len(track_names) != 3:
+        raise ValueError("Режим распределения только по предпочтениям рассчитан на три трека.")
+
+    ordered_students = sorted(students, key=lambda student: (not student.get("has_track_choice", False), student["id"]))
+    capacities = build_balanced_capacities(track_names, len(ordered_students))
+    track_a, track_b, track_c = track_names
+    capacity_a = capacities[track_a]
+    capacity_b = capacities[track_b]
+    capacity_c = capacities[track_c]
+
+    # В словаре states храним лучшую достигнутую оценку для каждой пары загрузок первых двух треков.
+    states: Dict[Tuple[int, int], Tuple[int, int, int, int, int]] = {(0, 0): (0, 0, 0, 0, 0)}
+    parents: Dict[Tuple[int, int, int], Tuple[Tuple[int, int], str]] = {}
+
+    for index, student in enumerate(ordered_students, start=1):
+        next_states: Dict[Tuple[int, int], Tuple[int, int, int, int, int]] = {}
+        for (count_a, count_b), score in sorted(states.items()):
+            count_c = (index - 1) - count_a - count_b
+
+            if count_a < capacity_a:
+                next_state = (count_a + 1, count_b)
+                next_score = add_score_tuple(score, calculate_preference_score(student, track_a))
+                if next_state not in next_states or next_score > next_states[next_state]:
+                    next_states[next_state] = next_score
+                    parents[(index, next_state[0], next_state[1])] = ((count_a, count_b), track_a)
+
+            if count_b < capacity_b:
+                next_state = (count_a, count_b + 1)
+                next_score = add_score_tuple(score, calculate_preference_score(student, track_b))
+                if next_state not in next_states or next_score > next_states[next_state]:
+                    next_states[next_state] = next_score
+                    parents[(index, next_state[0], next_state[1])] = ((count_a, count_b), track_b)
+
+            if count_c < capacity_c:
+                next_state = (count_a, count_b)
+                next_score = add_score_tuple(score, calculate_preference_score(student, track_c))
+                if next_state not in next_states or next_score > next_states[next_state]:
+                    next_states[next_state] = next_score
+                    parents[(index, next_state[0], next_state[1])] = ((count_a, count_b), track_c)
+
+        states = next_states
+
+    final_state = (capacity_a, capacity_b)
+    if final_state not in states:
+        raise ValueError("Не удалось построить равномерное распределение только по предпочтениям.")
+
+    assignments_reversed: List[Tuple[dict, str]] = []
+    current_state = final_state
+    for index in range(len(ordered_students), 0, -1):
+        previous_state, assigned_track = parents[(index, current_state[0], current_state[1])]
+        assignments_reversed.append((ordered_students[index - 1], assigned_track))
+        current_state = previous_state
+
+    assignments = list(reversed(assignments_reversed))
+    results: List[dict] = []
+    for place, (student, assigned_track) in enumerate(assignments, start=1):
+        results.append(
+            {
+                "id": student["id"],
+                "track": assigned_track,
+                "place": "",
+                "rating": "",
+                "has_track_choice": student.get("has_track_choice", True),
+                "no_choice_status": student["optional"].get("no_choice_status", ""),
+                "track_preferences": student["track_preferences"],
+                "assignment_rank_text": build_assignment_rank_text(student, assigned_track),
+                "optimization_order": place,
+            }
+        )
+    return results
+
+
 def build_subject_order(students: Sequence[dict]) -> Dict[str, int]:
+    """Формирует стабильный порядок предметов для расчета антисовпадающего компонента рейтинга."""
     subjects = sorted({item["normalized_subject"] for student in students for item in student["grades"]})
     return {subject: index + 1 for index, subject in enumerate(subjects)}
 
 
 def calculate_id_micro_bonus(student_id: str) -> float:
+    """Добавляет очень малый детерминированный бонус по id, чтобы уменьшить совпадения рейтинга."""
     digits = "".join(symbol for symbol in str(student_id) if symbol.isdigit())
     if digits:
         digit_signature = sum((index + 1) * int(digit) for index, digit in enumerate(reversed(digits[-12:])))
@@ -385,6 +526,7 @@ def calculate_student_rating(
     cohort_maxima: dict,
     subject_order: Dict[str, int],
 ) -> None:
+    """Считает рейтинг студента по оценкам, прогрессу и дополнительным достижениям."""
     grades_by_semester: Dict[int, List[float]] = defaultdict(list)
     subject_history: Dict[str, List[Tuple[int, float]]] = defaultdict(list)
     all_grades: List[float] = []
@@ -485,6 +627,7 @@ def calculate_student_rating(
 
 
 def parse_students_from_workbook(workbook: WorkbookData) -> Tuple[List[dict], List[str]]:
+    """Читает студентов с листа Excel и собирает все нужные признаки в одну модель."""
     sheet, header_row = find_input_sheet(workbook)
     headers = read_header_map(sheet, header_row)
     semester_marks = read_semester_marks(sheet, max(1, header_row - 1), sheet["max_col"])
@@ -540,6 +683,7 @@ def parse_students_from_workbook(workbook: WorkbookData) -> Tuple[List[dict], Li
 
 
 def rank_students(students: List[dict]) -> List[dict]:
+    """Строит рейтинг студентов по оценкам и дополнительным факторам."""
     semesters = sorted({item["semester"] for student in students for item in student["grades"]})
     weights = compute_semester_weights(semesters)
     subject_order = build_subject_order(students)
@@ -557,6 +701,7 @@ def rank_students(students: List[dict]) -> List[dict]:
 
 
 def assign_tracks(ranked_students: List[dict], track_names: List[str]) -> List[dict]:
+    """Распределяет студентов по трекам в режиме, когда порядок задается рейтингом."""
     capacities = build_balanced_capacities(track_names, len(ranked_students))
     loads = {track_name: 0 for track_name in track_names}
     results: List[dict] = []
@@ -572,12 +717,15 @@ def assign_tracks(ranked_students: List[dict], track_names: List[str]) -> List[d
                 "has_track_choice": student.get("has_track_choice", True),
                 "no_choice_status": student["optional"].get("no_choice_status", ""),
                 "track_preferences": student["track_preferences"],
+                "assignment_rank_text": build_assignment_rank_text(student, assigned),
+                "optimization_order": "",
             }
         )
     return results
 
 
 def xml_cell(ref: str, value: object) -> str:
+    """Создает XML-представление одной ячейки Excel."""
     if value is None or value == "":
         return ""
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -588,6 +736,7 @@ def xml_cell(ref: str, value: object) -> str:
 
 
 def build_sheet_xml(rows: Sequence[Sequence[object]]) -> str:
+    """Собирает XML одного листа Excel из двумерного массива значений."""
     xml_rows: List[str] = []
     for row_index, row in enumerate(rows, start=1):
         cells = []
@@ -604,6 +753,7 @@ def build_sheet_xml(rows: Sequence[Sequence[object]]) -> str:
 
 
 def write_xlsx_workbook(path: Path, sheets: Sequence[Tuple[str, Sequence[Sequence[object]]]]) -> None:
+    """Записывает целую книгу xlsx с несколькими листами без внешних зависимостей."""
     path.parent.mkdir(parents=True, exist_ok=True)
     created = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     sheet_defs = [(name[:31], rows) for name, rows in sheets]
@@ -690,10 +840,12 @@ def write_xlsx_workbook(path: Path, sheets: Sequence[Tuple[str, Sequence[Sequenc
 
 
 def write_simple_xlsx(path: Path, sheet_name: str, rows: Sequence[Sequence[object]]) -> None:
+    """Упрощенная обертка для записи книги Excel с одним листом."""
     write_xlsx_workbook(path, [(sheet_name, rows)])
 
 
 def create_sample_input_file(path: Path) -> None:
+    """Создает пример входного файла, который можно использовать как шаблон."""
     rows = [
         ["Пример входных данных для распределения по трекам"],
         ["", "1 семестр", "", "", "2 семестр", "", "", "3 семестр", "", "", "", "", "", "", "", "", "", "", "", ""],
@@ -706,35 +858,80 @@ def create_sample_input_file(path: Path) -> None:
     write_simple_xlsx(path, "Входные данные", rows)
 
 
-def write_output_file(path: Path, assignments: List[dict], track_names: List[str]) -> None:
-    result_rows: List[List[object]] = [["id ученика", "трек", "место в рейтинге", "рейтинг", "выбор трека", "статус без выбора", "приоритеты"]]
+def write_output_file(path: Path, assignments: List[dict], track_names: List[str], assignment_mode: str) -> None:
+    """Формирует итоговый файл результата с назначениями, сводкой и проверкой гипотезы."""
+    result_rows: List[List[object]] = [["id ученика", "трек", "место в рейтинге", "рейтинг", "режим распределения", "попадание по предпочтению", "выбор трека", "статус без выбора", "приоритеты"]]
     no_choice_rows: List[List[object]] = [["id ученика", "трек", "место в рейтинге", "рейтинг", "статус без выбора"]]
     assigned_count = {track_name: 0 for track_name in track_names}
     priority_summary_rows: List[List[object]] = [["трек", "назначено студентов", "приоритет 1", "приоритет 1 или 2"]]
     priority_list_rows: List[List[object]] = [["трек", "количество студентов с приоритетом 1 или 2", "id студентов с приоритетом 1 или 2"]]
+    mode_rows: List[List[object]] = [["параметр", "значение"]]
+    answered_students = 0
+    first_priority_assignments = 0
+    second_priority_assignments = 0
+    no_choice_students = 0
 
     for item in assignments:
         assigned_count[item["track"]] += 1
         priorities_text = ", ".join(f"{track_name}: {item['track_preferences'].get(track_name, 0)}" for track_name in track_names)
         choice_mark = "выбор указан" if item["has_track_choice"] else "выбор не указан"
         no_choice_status = item["no_choice_status"] if item["has_track_choice"] else (item["no_choice_status"] or "статус не указан")
-        result_rows.append([item["id"], item["track"], item["place"], item["rating"], choice_mark, no_choice_status if not item["has_track_choice"] else "", priorities_text])
+        if item["has_track_choice"]:
+            answered_students += 1
+            if item["assignment_rank_text"] == "приоритет 1":
+                first_priority_assignments += 1
+            elif item["assignment_rank_text"] == "приоритет 2":
+                second_priority_assignments += 1
+        else:
+            no_choice_students += 1
+        result_rows.append(
+            [
+                item["id"],
+                item["track"],
+                item["place"],
+                item["rating"],
+                "только предпочтения" if assignment_mode == "preferences_only" else "с рейтингом",
+                item["assignment_rank_text"],
+                choice_mark,
+                no_choice_status if not item["has_track_choice"] else "",
+                priorities_text,
+            ]
+        )
         if not item["has_track_choice"]:
             no_choice_rows.append([item["id"], item["track"], item["place"], item["rating"], no_choice_status])
 
     if len(no_choice_rows) == 1:
         no_choice_rows.append(["нет студентов без выбора", "", "", "", ""])
 
+    # На этих листах считаем, сколько студентов выбрали трек первым
+    # и сколько включили его в пару приоритетов 1-2.
     for track_name in track_names:
         priority_1_ids = [item["id"] for item in assignments if item["track_preferences"].get(track_name) == 1]
         priority_1_2_ids = [item["id"] for item in assignments if item["track_preferences"].get(track_name) in (1, 2)]
         priority_summary_rows.append([track_name, assigned_count[track_name], len(priority_1_ids), len(priority_1_2_ids)])
         priority_list_rows.append([track_name, len(priority_1_2_ids), ", ".join(priority_1_2_ids)])
 
+    mode_rows.extend(
+        [
+            ["режим распределения", "только предпочтения" if assignment_mode == "preferences_only" else "с учетом рейтинга"],
+            ["оценки участвуют в распределении", "нет" if assignment_mode == "preferences_only" else "да"],
+            ["всего студентов", len(assignments)],
+            ["студентов с указанными предпочтениями", answered_students],
+            ["студентов без выбора", no_choice_students],
+            ["назначено на приоритет 1", first_priority_assignments],
+            ["назначено на приоритет 2", second_priority_assignments],
+            ["назначено вне приоритетов или без выбора", len(assignments) - first_priority_assignments - second_priority_assignments],
+            ["минимум по треку", min(assigned_count.values()) if assigned_count else 0],
+            ["максимум по треку", max(assigned_count.values()) if assigned_count else 0],
+            ["гипотеза", "равномерное распределение без рейтинга возможно" if assignment_mode == "preferences_only" else "используется режим с рейтингом"],
+        ]
+    )
+
     write_xlsx_workbook(
         path,
         [
             ("Результат", result_rows),
+            ("Гипотеза", mode_rows),
             ("Количество_по_трекам", priority_summary_rows),
             ("Без_выбора", no_choice_rows),
             ("Приоритеты_1_2", priority_list_rows),
@@ -742,17 +939,22 @@ def write_output_file(path: Path, assignments: List[dict], track_names: List[str
     )
 
 
-def run(input_file: Path, output_folder: Path) -> Tuple[Path, int]:
+def run(input_file: Path, output_folder: Path, assignment_mode: str = "with_rating") -> Tuple[Path, int]:
+    """Главная рабочая функция: читает вход, распределяет студентов и пишет итоговый xlsx."""
     workbook = read_xlsx(input_file)
     students, track_names = parse_students_from_workbook(workbook)
-    ranked_students = rank_students(students)
-    assignments = assign_tracks(ranked_students, track_names)
+    if assignment_mode == "preferences_only":
+        assignments = assign_tracks_by_preferences_only(students, track_names)
+    else:
+        ranked_students = rank_students(students)
+        assignments = assign_tracks(ranked_students, track_names)
     output_file = output_folder / OUTPUT_FILE_NAME
-    write_output_file(output_file, assignments, track_names)
+    write_output_file(output_file, assignments, track_names, assignment_mode)
     return output_file, len(assignments)
 
 
-def main(input_file_path: str) -> None:
+def main(input_file_path: str, assignment_mode: str = DEFAULT_ASSIGNMENT_MODE) -> None:
+    """Точка входа для ручного запуска скрипта."""
     script_folder = Path(__file__).resolve().parent
     output_folder = script_folder / OUTPUT_FOLDER_NAME
     sample_input_path = script_folder / SAMPLE_INPUT_FILE_NAME
@@ -764,12 +966,13 @@ def main(input_file_path: str) -> None:
             "Исправьте путь прямо в вызове main(...).\n"
             f"Для примера уже создан файл: {sample_input_path}"
         )
-    output_file, count = run(input_file, output_folder)
+    output_file, count = run(input_file, output_folder, assignment_mode=assignment_mode)
     print("Готово.")
     print(f"Обработано студентов: {count}")
+    print(f"Режим распределения: {'только предпочтения' if assignment_mode == 'preferences_only' else 'с учетом рейтинга'}")
     print(f"Файл результата: {output_file}")
     print(f"Файл-образец: {sample_input_path}")
 
 
 if __name__ == "__main__":
-    main(r"C:\Users\A006\Downloads\Рейтинг.xlsx")
+    main(r"C:\Users\A006\Downloads\Рейтинг_40.xlsx")
